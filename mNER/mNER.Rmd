@@ -1,0 +1,424 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.16.0
+  kernelspec:
+    display_name: Python 3 (ipykernel)
+    language: python
+    name: python3
+---
+
+```{python}
+from collections import defaultdict
+from datasets import DatasetDict
+from datasets import get_dataset_config_names
+from datasets import load_dataset
+import pandas as pd
+from collections import Counter
+import os
+
+import torch.nn as nn
+from torch.nn.functional import cross_entropy
+import torch
+from transformers import XLMRobertaConfig
+from transformers import AutoModel
+from transformers.modeling_outputs import TokenClassifierOutput
+from transformers.models.roberta.modeling_roberta import RobertaModel
+from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel
+from transformers import AutoConfig
+from transformers import AutoTokenizer
+from transformers import TrainingArguments
+from transformers import DataCollatorForTokenClassification
+from transformers import Trainer
+
+from seqeval.metrics import classification_report
+from seqeval.metrics import f1_score
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
+
+print(f"Current position: {os.getcwd()}")
+```
+
+## Preprocessing PANX multilingual dataset
+
+```{python}
+# Load dataset in different languages with their real fractions
+langs = ["de", "fr", "it", "en"]
+fracs = [0.629, 0.229, 0.084, 0.059]
+
+# Return a DatasetDict if a key doesn't exist
+panx_ch = defaultdict(DatasetDict)
+for lang, frac in zip(langs, fracs):
+    ds = load_dataset("xtreme", name=f"PAN-X.{lang}")
+    for split in ds:
+        panx_ch[lang][split] = (
+            ds[split].shuffle(seed=0).select(range(int(frac * ds[split].num_rows)))
+        )
+```
+
+```{python}
+# Number of training examples after selection
+pd.DataFrame({lang: [panx_ch[lang]["train"].num_rows] for lang in langs}, index=["Number of training examples"])
+```
+
+```{python}
+element = panx_ch["de"]["train"][0]
+for key, value in element.items():
+    print(f"{key}: {value}")
+```
+
+```{python}
+for key, value in panx_ch["de"]["train"].features.items():
+    print(f"{key}: {value}")
+```
+
+```{python}
+tags = panx_ch["de"]["train"].features["ner_tags"].feature
+print(f"Tags: {tags}")
+```
+
+```{python}
+# Create new column in training set with class names for each tag
+def create_tag_names(batch):
+    return {"ner_tags_str": [tags.int2str(idx) for idx in batch["ner_tags"]]}
+```
+
+```{python}
+panx_de = panx_ch["de"].map(create_tag_names)
+```
+
+```{python}
+# Quick check if there are imbalance in tags
+split2freqs = defaultdict(Counter)
+for split, dataset in panx_de.items():
+    for row in dataset["ner_tags_str"]:
+        for tag in row:
+            if tag.startswith("B"):
+                tag_type = tag.split("-")[1]
+                split2freqs[split][tag_type] += 1
+
+pd.DataFrame.from_dict(split2freqs, orient="index")
+```
+
+## Custom Multilingual Transformers
+
+```{python}
+xlmr_model_name = "xlm-roberta-base"
+xlmr_tokenizer = AutoTokenizer.from_pretrained(xlmr_model_name)
+```
+
+```{python}
+class XLMRobertaForTokenClassification(RobertaPreTrainedModel):
+    config_class = XLMRobertaConfig
+    
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        # Load model body
+        self.roberta = RobertaModel(config, add_pooling_layer=False)
+        # Set up token classification head
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        # Load and initialize weights
+        self.init_weights()
+        
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None, **kwargs):
+        # Use model body to get encoder representations
+        outputs = self.roberta(input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids, **kwargs)
+        # Apply classifier to encoder representation
+        sequence_output = self.dropout(outputs[0])
+        logits = self.classifier(sequence_output)
+        # Calculate losses
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            
+        # Return model output object
+        return TokenClassifierOutput(loss=loss, 
+                                     logits=logits,
+                                     hidden_states=outputs.hidden_states,
+                                     attentions=outputs.attentions)
+```
+
+```{python}
+index2tag = {idx: tag for idx, tag in enumerate(tags.names)}
+tag2index = {tag: idx for idx, tag in enumerate(tags.names)}
+
+xlmr_config = AutoConfig.from_pretrained(xlmr_model_name, 
+                                         num_labels=tags.num_classes,
+                                         id2label=index2tag, label2id=tag2index)
+```
+
+```{python}
+# Move model to the appropriate device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+xlmr_model = XLMRobertaForTokenClassification.from_pretrained(xlmr_model_name, config=xlmr_config).to(device)
+```
+
+```{python}
+# Helper function to attach tags for tokens
+def tag_text(text, tags, model, tokenizer):
+    tokens = tokenizer(text).tokens()
+    input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
+    outputs = model(input_ids).logits
+    predictions = torch.argmax(outputs, dim=-1)
+    preds = [tags.names[p] for p in predictions[0].cpu().numpy()]
+    return pd.DataFrame([tokens, preds], index=["Tokens", "Tags"])
+```
+
+## Tokenize texts for NER
+
+```{python}
+def tokenize_and_align_labels(examples):
+    tokenized_inputs = xlmr_tokenizer(examples["tokens"], truncation=True, 
+                                      is_split_into_words=True)
+    labels = []
+    for idx, label in enumerate(examples["ner_tags"]):
+        word_ids = tokenized_inputs.word_ids(batch_index=idx)
+        previous_word_idx = None
+        label_ids = []
+        for word_idx in word_ids:
+            if word_idx is None or word_idx == previous_word_idx:
+                label_ids.append(-100)
+            else:
+                label_ids.append(label[word_idx])
+            previous_word_idx = word_idx
+        labels.append(label_ids)
+    tokenized_inputs["labels"] = labels
+    return tokenized_inputs
+```
+
+```{python}
+def encode_panx_dataset(corpus):
+    return corpus.map(tokenize_and_align_labels, batched=True, 
+                      remove_columns=['langs', 'ner_tags', 'tokens'])
+```
+
+```{python}
+panx_de_encoded = encode_panx_dataset(panx_ch["de"])
+```
+
+### Calculate metrics
+
+```{python}
+def align_predictions(predictions, label_ids):
+    preds = np.argmax(predictions, axis=-1)
+    batch_size, seq_len = preds.shape
+    labels_list, preds_list = [], []
+    
+    for batch_idx in range(batch_size):
+        example_labels, example_preds = [], []
+        for seq_idx in range(seq_len):
+            if label_ids[batch_idx, seq_idx] != -100:
+                example_labels.append(index2tag[label_ids[batch_idx, seq_idx]])
+                example_preds.append(index2tag[preds[batch_idx, seq_idx]])
+            
+        labels_list.append(example_labels)
+        preds_list.append(example_preds)
+    return preds_list, labels_list
+```
+
+### Fine-tune XLM-RoBERTa
+
+```{python}
+num_epochs = 3
+batch_size = 24
+logging_steps = len(panx_de_encoded["train"]) // batch_size
+model_name = f"{xlmr_model_name}-finetuned-panx-de"
+training_args = TrainingArguments(
+    output_dir=model_name, log_level="error", num_train_epochs=num_epochs, 
+    per_device_train_batch_size=batch_size, 
+    per_device_eval_batch_size=batch_size, evaluation_strategy="epoch", 
+    save_steps=1e6, weight_decay=0.01, disable_tqdm=False, 
+    logging_steps=logging_steps)
+```
+
+```{python}
+def compute_metrics(eval_pred):
+    y_pred, y_true = align_predictions(eval_pred.predictions, eval_pred.label_ids)
+    return {"f1": f1_score(y_true, y_pred)}
+```
+
+```{python}
+data_collator = DataCollatorForTokenClassification(xlmr_tokenizer)
+```
+
+```{python}
+def model_init():
+    return (XLMRobertaForTokenClassification
+            .from_pretrained(xlmr_model_name, config=xlmr_config)
+            .to(device))
+```
+
+```{python}
+trainer = Trainer(model_init=model_init, args=training_args, 
+                  data_collator=data_collator, compute_metrics=compute_metrics,
+                  train_dataset=panx_de_encoded["train"],
+                  eval_dataset=panx_de_encoded["validation"], 
+                  tokenizer=xlmr_tokenizer)
+```
+
+```{python}
+trainer.train()
+```
+
+```{python}
+trainer.push_to_hub(commit_message="Training completed!")
+```
+
+### Error Analysis
+
+```{python}
+trained_model = XLMRobertaForTokenClassification.from_pretrained("triet1102/xlm-roberta-base-finetuned-panx-de")
+trainer = Trainer(model=trained_model, 
+                  args=training_args, 
+                  data_collator=data_collator, compute_metrics=compute_metrics,
+                  train_dataset=panx_de_encoded["train"],
+                  eval_dataset=panx_de_encoded["validation"], 
+                  tokenizer=xlmr_tokenizer)
+```
+
+```{python}
+def forward_pass_with_label(batch):
+    # Convert dict of lists to list of dicts suitable for data collator
+    features = [dict(zip(batch, t)) for t in zip(*batch.values())]
+    # Pad inputs and labels
+    batch = data_collator(features)
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
+    labels = batch["labels"].to(device)
+    with torch.no_grad():
+        output = trainer.model(input_ids, attention_mask)
+        # Logit.size: [batch_size, sequence_length, classes]
+        predicted_label = torch.argmax(output.logits, axis=-1).cpu().numpy()
+    loss = cross_entropy(output.logits.view(-1, 7), labels.view(-1), reduction="none")
+    loss = loss.view(len(input_ids), -1).cpu().numpy()
+    
+    return {"loss": loss, "predicted_label": predicted_label}
+```
+
+```{python}
+valid_set = panx_de_encoded["validation"]
+valid_set = valid_set.map(forward_pass_with_label, batched=True, batch_size=32)
+df = valid_set.to_pandas()
+```
+
+```{python}
+df.head()
+```
+
+```{python}
+# hide_output
+index2tag[-100] = "IGN"
+df["input_tokens"] = df["input_ids"].apply(
+    lambda x: xlmr_tokenizer.convert_ids_to_tokens(x))
+df["predicted_label"] = df["predicted_label"].apply(
+    lambda x: [index2tag[i] for i in x])
+df["labels"] = df["labels"].apply(
+    lambda x: [index2tag[i] for i in x])
+df['loss'] = df.apply(
+    lambda x: x['loss'][:len(x['input_ids'])], axis=1)
+df['predicted_label'] = df.apply(
+    lambda x: x['predicted_label'][:len(x['input_ids'])], axis=1)
+df.head(1)
+```
+
+```{python}
+# hide_output
+df_tokens = df.apply(pd.Series.explode)
+df_tokens = df_tokens.query("labels != 'IGN'")
+df_tokens["loss"] = df_tokens["loss"].astype(float).round(2)
+df_tokens.head(7)
+```
+
+```{python}
+type(df_tokens[["loss", "input_ids"]])
+```
+
+```{python}
+(df_tokens.groupby("input_tokens")[['loss']]
+ .agg(["count", "mean", "sum"])
+ .droplevel(level=0, axis=1)
+ .sort_values(by="sum", ascending=False)
+ .reset_index()
+ .round(2)
+ .head(10)
+ .T
+)
+```
+
+```{python}
+(df_tokens.groupby("labels")[["loss"]]
+ .agg(["count", "mean", "sum"])
+ .droplevel(level=0, axis=1)
+ .sort_values(by="mean", ascending=False)
+ .reset_index()
+ .round(2)
+ .T
+)
+```
+
+```{python}
+def plot_confusion_matrix(y_true, y_preds, labels):
+    cm = confusion_matrix(y_true, y_preds, normalize="true")
+    fig, ax = plt.subplots(figsize=(6, 6))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    disp.plot(cmap="Blues", values_format=".2f", ax=ax, colorbar=False)
+    plt.title("Normalized confusion matrix")
+    plt.show()
+```
+
+```{python}
+plot_confusion_matrix(df_tokens["labels"], df_tokens["predicted_label"],
+                      tags.names)
+```
+
+### Cross-lingual transfer
+
+```{python}
+def get_f1_score(trainer, dataset):
+    return trainer.predict(dataset).metrics["test_f1"]
+```
+
+```{python}
+f1_scores = defaultdict(dict)
+f1_scores["de"]["de"] = get_f1_score(trainer, panx_de_encoded["test"])
+```
+
+```{python}
+print(f"F1-score of [de] model on [de] dataset: {f1_scores['de']['de']:.3f}")
+```
+
+```{python}
+text_fr = "Jeff Dean est informaticien chez Google en Californie"
+tag_text(text_fr, tags, trainer.model, xlmr_tokenizer)
+```
+
+```{python}
+def evaluate_lang_performance(lang, trainer):
+    panx_ds = encode_panx_dataset(panx_ch[lang])
+    return get_f1_score(trainer, panx_ds["test"])
+```
+
+```{python}
+f1_scores["de"]["fr"] = evaluate_lang_performance("fr", trainer)
+print(f"F1-score of [de] model on [de] dataset: {f1_scores['de']['fr']:.3f}")
+```
+
+```{python}
+# hide_output
+f1_scores["de"]["it"] = evaluate_lang_performance("it", trainer)
+print(f"F1-score of [de] model on [it] dataset: {f1_scores['de']['it']:.3f}")
+```
+
+```{python}
+#hide_output
+f1_scores["de"]["en"] = evaluate_lang_performance("en", trainer)
+print(f"F1-score of [de] model on [en] dataset: {f1_scores['de']['en']:.3f}")
+```
