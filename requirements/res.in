@@ -3,3 +3,6 @@ notebook
 plotly
 kaleido
 transformers
+datasets>=2.16.0
+ipywidgets
+matplotlib
