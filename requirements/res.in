@@ -6,3 +6,4 @@ transformers
 datasets>=2.16.0
 ipywidgets
 matplotlib
+torch
