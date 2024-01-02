@@ -1,0 +1,194 @@
+---
+jupyter:
+  jupytext:
+    formats: ipynb,Rmd
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.16.0
+  kernelspec:
+    display_name: Python 3 (ipykernel)
+    language: python
+    name: python3
+---
+
+```{python}
+from datasets import get_dataset_config_names, load_dataset
+import pandas as pd
+import matplotlib.pyplot as plt
+from transformers import AutoTokenizer
+import torch
+from transformers import AutoModelForQuestionAnswering, pipeline
+from pprint import pprint
+```
+
+```{python}
+# get the categories of the dataset
+domains = get_dataset_config_names("subjqa")
+print(domains)
+```
+
+```{python}
+# load the dataset
+subjqa = load_dataset("subjqa", name="electronics")
+```
+
+```{python}
+print(subjqa["train"]["answers"][1])
+print()
+print(subjqa["train"]["question"][1])
+```
+
+```{python}
+dfs = {split: dset.to_pandas() for split, dset in subjqa.flatten().items()}
+```
+
+```{python}
+# get the number of unique questions
+for split, df in dfs.items():
+    print(f"Number of questions in {split}: {df['id'].nunique()}")
+```
+
+```{python}
+dfs["train"]
+```
+
+```{python}
+# get only interesting columns
+qa_cols = [
+    "title",
+    "question",
+    "answers.text",
+    "answers.answer_start",
+    "context",
+]
+
+sample_df = dfs["train"][qa_cols].sample(2, random_state=7)
+```
+
+```{python}
+sample_df
+```
+
+```{python}
+start_idx = sample_df["answers.answer_start"].iloc[0][0]
+end_idx = start_idx + len(sample_df["answers.text"].iloc[0][0])
+print(sample_df["context"].iloc[0][start_idx:end_idx])
+```
+
+```{python}
+# get the statistics of questions that start with a few common words
+counts = {}
+question_types = ["What", "How", "Is", "Does", "Do", "Was", "Where", "Why"]
+
+for q in question_types:
+    counts[q] = dfs["train"]["question"].str.startswith(q).value_counts()[True]
+
+print(counts)
+```
+
+```{python}
+# show the frequency in histogram
+pd.Series(counts).sort_values().plot.barh()
+plt.title("Frequency of Question Types")
+plt.show()
+```
+
+```{python}
+for question_type in ["How", "What", "Is"]:
+    for question in dfs["train"][dfs["train"]["question"].str.startswith(question_type)].sample(n=3, random_state=42)["question"]:
+        print(question)
+    print()
+```
+
+```{python}
+# load the model tokenizer
+model_ckpt = "deepset/minilm-uncased-squad2"
+tokenizer = AutoTokenizer.from_pretrained(model_ckpt)
+```
+
+```{python}
+question = "How much music can this hold?"
+context = "An MP3 is about 1 MB/minute, so about 6000 hours depending on file size."
+inputs = tokenizer(text=question, text_pair=context, return_tensors="pt")
+pprint(inputs)
+```
+
+```{python}
+len(inputs["input_ids"][0])
+```
+
+```{python}
+print(tokenizer.decode(inputs["input_ids"][0]))
+```
+
+```{python}
+# infer the inputs
+model = AutoModelForQuestionAnswering.from_pretrained(model_ckpt)
+with torch.no_grad():
+    output = model(**inputs)
+print(output)
+```
+
+```{python}
+# get the start and end logits
+start_logits = output["start_logits"]
+end_logits = output["end_logits"]
+```
+
+```{python}
+print(f"Input ID shape: {inputs.input_ids.size()}")
+print(f"Start logits shape: {start_logits.size()}")
+print(f"End logits shape: {end_logits.size()}")
+```
+
+```{python}
+start_idx = torch.argmax(start_logits)
+end_idx = torch.argmax(end_logits) + 1
+answer_span = inputs["input_ids"][0][start_idx:end_idx]
+answer = tokenizer.decode(answer_span)
+print(f"Question: {question}")
+print(f"Context: {context}")
+print(f"Answer: {answer}")
+```
+
+```{python}
+# get the processing pipeline
+pipe = pipeline("question-answering", model=model, tokenizer=tokenizer)
+pipe(question=question, context=context, top_k=3)
+```
+
+```{python}
+# try no answer is possible
+pipe(question="Why is there no data?", context=context, handle_impossible_answer=True)
+```
+
+```{python}
+# try sliding window for long context
+example = dfs["train"].iloc[0][["question", "context"]]
+tokenized_example = tokenizer(example["question"], example["context"],
+                              return_overflowing_tokens=True, 
+                              max_length=100,
+                              stride=25,
+                              truncation=True,
+                             )
+```
+
+```{python}
+for idx, window in enumerate(tokenized_example["input_ids"]):
+    print(f"Window #{idx} has length {len(window)} tokens")
+```
+
+```{python}
+for idx, window in enumerate(tokenized_example["input_ids"]):
+    print(f"Window #{idx}'s text: {tokenizer.decode(window)}\n")
+```
+
+```{python}
+tokenized_example
+```
+
+```{python}
+
+```
