@@ -9,4 +9,5 @@ ipywidgets
 matplotlib
 torch
 farm-haystack
-elasticsearch8
+elasticsearch
+sentence_transformers
