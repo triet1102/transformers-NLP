@@ -21,6 +21,12 @@ from transformers import AutoTokenizer
 import torch
 from transformers import AutoModelForQuestionAnswering, pipeline
 from pprint import pprint
+import os
+from subprocess import Popen, PIPE, STDOUT
+from haystack.document_stores.elasticsearch import ElasticsearchDocumentStore
+from haystack.nodes.retriever import BM25Retriever
+from haystack.nodes.reader.farm import FARMReader
+from haystack.pipelines import ExtractiveQAPipeline
 ```
 
 ```{python}
@@ -186,7 +192,112 @@ for idx, window in enumerate(tokenized_example["input_ids"]):
 ```
 
 ```{python}
-tokenized_example
+# download and run elastic search in a container
+# https://www.elastic.co/guide/en/elasticsearch/reference/8.11/docker.html
+```
+
+```{python}
+# initialize document store
+document_store = ElasticsearchDocumentStore(username="elastic",
+                                            password="qljxKyScJxIhP9Ef=aGa",
+                                            ca_certs="/Users/triettran/http_ca.crt",
+                                            scheme="https",
+                                            return_embedding=True)
+```
+
+```{python}
+for split, df in dfs.items():
+    # exclude duplicate reviews
+    docs = [{
+        "content": row["context"],
+        "meta": {
+            "item_id": row["title"],
+            "question_id": row["id"],
+            "split": split,
+        }
+    } for _, row in df.drop_duplicates(subset="context").iterrows()]
+    document_store.write_documents(documents=docs, index="document")
+```
+
+```{python}
+print(f"Loaded {document_store.get_document_count()} documents")
+```
+
+```{python}
+# initialize the retriever
+es_retriever = BM25Retriever(document_store=document_store)
+```
+
+```{python}
+dfs["train"][dfs["train"]["title"] == "B0074BW614"]
+```
+
+```{python}
+# get reviews of B0074BW614 items
+item_id = "B0074BW614"
+query = "Is it good for reading"
+retrieved_docs = es_retriever.retrieve(
+    query=query,
+    top_k=3,
+    filters={
+        "item_id": [item_id],
+        "split": ["train"],
+    }
+)
+```
+
+```{python}
+pprint(retrieved_docs[0])
+```
+
+```{python}
+# initialize a reader
+model_ckpt = "deepset/minilm-uncased-squad2"
+max_seq_length, doc_stride = 384, 128
+reader = FARMReader(
+    model_name_or_path=model_ckpt,
+    progress_bar=True,
+    max_seq_len=max_seq_length,
+    doc_stride=doc_stride,
+    return_no_answer=True,
+)
+```
+
+```{python}
+print(reader.predict_on_texts(question=question, texts=[context], top_k=1))
+```
+
+```{python}
+# put retriever and reader together
+pipe = ExtractiveQAPipeline(reader, es_retriever)
+```
+
+```{python}
+n_answers = 3
+preds = pipe.run(
+    query=query,
+    params={
+        "Retriever": {
+            "top_k": 3,
+            "filters": {
+                "item_id":[item_id],
+                "split":["train"],
+            },
+        },
+        "Reader": {
+            "top_k": n_answers,
+            }
+    }
+)
+```
+
+```{python}
+print(f"Query: {preds['query']}\n")
+
+for idx in range(n_answers):
+    print(f"Answer {idx}: {preds['answers'][idx].answer}")
+    print(f"Context {idx}: {preds['answers'][idx].context}")
+    print()
 ```
 
 ```{python}
